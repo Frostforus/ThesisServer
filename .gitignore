@@ -1,1 +1,5 @@
+# Ignore all files in the tmp directory
 tmp/*
+
+# Except the .gitkeep file
+!tmp/.gitkeep
