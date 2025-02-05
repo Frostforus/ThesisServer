@@ -1,10 +1,17 @@
 import torch
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
+from datetime import datetime
 import whisper
 import os
 
 app = FastAPI()
-
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["http://localhost:5173"],  # Add your SvelteKit dev server URL
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 # Load Whisper model (You can specify a model like 'base', 'small', etc.)
 model = whisper.load_model("base")
 # Optionally, you can check if CUDA is available and move the model to GPU
@@ -14,33 +21,41 @@ model = whisper.load_model("base")
 #     print("CUDA not available, using CPU.")
 
 @app.post("/transcribe/{user_id}")
-async def transcribe_audio(user_id: str, audio_file: UploadFile = File(...)):
-    # Get the directory of the current script (main.py)
+async def transcribe_audio(
+        user_id: str,
+        audio_file: UploadFile = File(...),
+        patient_name: str = Form(...),
+        session_date: datetime = Form(...)
+):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Define the temporary file path next to main.py
-    temp_file_path = os.path.join(script_dir,"tmp", audio_file.filename)
+    temp_file_path = os.path.join(script_dir, "tmp", audio_file.filename)
 
     try:
-        print(f"Transcribing audio file {audio_file.filename} for user {user_id}")
-        # Save the uploaded audio file temporarily
+        print(f"Received transcription request:")
+        print(f"Patient Name: {patient_name}")
+        print(f"Session Date: {session_date}")
+        print(f"Audio File: {audio_file.filename}")
+
+        os.makedirs(os.path.join(script_dir, "tmp"), exist_ok=True)
+
         with open(temp_file_path, "wb") as f:
             content = await audio_file.read()
             f.write(content)
+
         print(f"File saved to {temp_file_path}")
-        # Transcribe the audio file using Whisper
         result = model.transcribe(temp_file_path)
+
+        return {
+            "user_id": user_id,
+            "patient_name": patient_name,
+            "session_date": session_date,
+            "transcription": result['text']
+        }
     except Exception as e:
         return {"error": str(e)}
     finally:
-        pass
         if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)  # Remove the temporary file after transcription
-
-    return {
-        "user_id": user_id,
-        "transcription": result['text']
-    }
+            os.remove(temp_file_path)
 
 @app.get("/")
 async def root():

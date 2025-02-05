@@ -3,3 +3,5 @@ tmp/*
 
 # Except the .gitkeep file
 !tmp/.gitkeep
+
+.idea/*
