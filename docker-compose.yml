@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - "fastapi-app:latest"
+        - "fastapi-app:1.0"
+    image: fastapi-app:latest
+    container_name: fastapi-service
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - dev-network
+    volumes:
+      - ./app:/app
+
+networks:
+  dev-network:
+    external: true  # This indicates we're using an existing network
