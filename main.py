@@ -3,8 +3,27 @@ from fastapi import FastAPI, UploadFile, File, Form
 from datetime import datetime
 import whisper
 import os
+from pocketbase import PocketBase
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
+print(f"PyTorch version: {torch.__version__}")
+print(f"Whisper version: {whisper.__version__}")
+# Authenticate with PocketBase
+try:
+
+    pb = PocketBase(os.getenv('POCKETBASE_URL'))
+    pb.admins.auth_with_password(
+        os.getenv('POCKETBASE_ADMIN_EMAIL'),
+        os.getenv('POCKETBASE_ADMIN_PASSWORD')
+    )
+    print("Successfully authenticated with PocketBase as admin")
+except Exception as e:
+    print(f"Failed to authenticate with PocketBase: {str(e)}")
+    raise e
+
 # app.add_middleware(
 #     CORSMiddleware,
 #     allow_origins=["http://localhost:5173"],  # Add your SvelteKit dev server URL
@@ -14,15 +33,17 @@ app = FastAPI()
 # )
 # Load Whisper model (You can specify a model like 'base', 'small', etc.)
 model = whisper.load_model("base")
+
+
 # Optionally, you can check if CUDA is available and move the model to GPU
-# if torch.cuda.is_available():
-#     model = model.to("cuda")
-# else:
-#     print("CUDA not available, using CPU.")
+if torch.cuda.is_available():
+    model = model.to("cuda")
+    print("Model loaded successfully on GPU")
+else:
+    print("CUDA not available, using CPU.")
 
 @app.post("/transcribe/{user_id}")
 async def transcribe_audio(
-        user_id: str,
         audio_file: UploadFile = File(...),
         patient_name: str = Form(...),
         session_date: datetime = Form(...)
@@ -31,27 +52,54 @@ async def transcribe_audio(
     temp_file_path = os.path.join(script_dir, "tmp", audio_file.filename)
 
     try:
-        print(f"Received transcription request:")
-        print(f"Patient Name: {patient_name}")
-        print(f"Session Date: {session_date}")
-        print(f"Audio File: {audio_file.filename}")
-
+        print(f"Transcribing audio file: {audio_file.filename}")
+        # Save audio file temporarily
         os.makedirs(os.path.join(script_dir, "tmp"), exist_ok=True)
-
-        with open(temp_file_path, "wb") as f:
-            content = await audio_file.read()
+        content = await audio_file.read()
+        with open(temp_file_path, 'wb') as f:
             f.write(content)
 
-        print(f"File saved to {temp_file_path}")
+        # Transcribe audio
         result = model.transcribe(temp_file_path)
+        transcription_text = result['text']
+        print(f"Transcription: {transcription_text}")
+        # Create session record
+        session_data = {
+            "date": session_date.isoformat(),
+        }
+
+        session_record = pb.collection('sessions').create(session_data)
+
+        # Create transcription record with file
+        file_data = None
+        with open(temp_file_path, 'rb') as f:
+            file_data = f.read()
+
+        transcription_data = {
+            "content": transcription_text,
+            "model_used": "whisper",
+            "generation_time_secs": result.get('generation_time', 0),
+            "status": "transcribed",
+            "session": session_record.id,
+            "recording": (audio_file.filename, file_data, audio_file.content_type)
+        }
+
+        transcription_record = pb.collection('transcriptions').create(
+            transcription_data
+        )
+
+        print(f"Created session record: {session_record.id}")
+        print(f"Created transcription record: {transcription_record.id}")
 
         return {
-            "user_id": user_id,
-            "patient_name": patient_name,
-            "session_date": session_date,
-            "transcription": result['text']
+            "success": True,
+            "session_id": session_record.id,
+            "transcription_id": transcription_record.id,
+            "transcription": transcription_text
         }
+
     except Exception as e:
+        print(f"Error: {str(e)}")
         return {"error": str(e)}
     finally:
         if os.path.exists(temp_file_path):
