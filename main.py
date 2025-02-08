@@ -1,5 +1,5 @@
 import torch
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
 from datetime import datetime
 import whisper
 import os
@@ -10,6 +10,13 @@ from pydub import AudioSegment
 import requests
 import logging
 import colorlog
+from pathlib import Path
+import magic
+from typing import Optional
+# Ignore Magic SyntaxWarning
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 
 # Configure logging with colors
@@ -29,7 +36,7 @@ def setup_logger():
 
     logger = colorlog.getLogger('app')
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     return logger
 
 
@@ -53,13 +60,14 @@ except Exception as e:
     logger.error(f"Failed to authenticate with PocketBase: {str(e)}")
     raise e
 
-model = whisper.load_model("tiny")
+# Global variables
+MODEL_VERSION = "tiny"
+model: Optional[whisper.Whisper] = None
 
-if torch.cuda.is_available():
-    model = model.to("cuda")
-    logger.info("Model loaded successfully on GPU")
-else:
-    logger.warning("CUDA not available, using CPU.")
+
+@app.on_event("startup")
+async def startup_event():
+    load_model(MODEL_VERSION)
 
 
 def process_audio_transcription(
@@ -86,21 +94,23 @@ def process_audio_transcription(
 
         logger.info(f"Transcription completed in {execution_time:.2f} seconds")
         transcription_speed_ratio = audio_length / execution_time
-        logger.info(f"Transcription speed ratio: {transcription_speed_ratio:.2f}x")
+        logger.debug(f"Transcription speed ratio: {transcription_speed_ratio:.2f}x")
         logger.debug(f"Transcription: {transcription_text}")
 
         url = "http://localhost:8090/api/collections/transcriptions/records"
 
         with open(file_path, 'rb') as f:
-            from pathlib import Path
+            mime_type = magic.from_buffer(f.read(2048), mime=True)
+            f.seek(0)  # Reset file pointer to beginning
             files = {
-                'recording': (Path(file_path).name, f, 'audio/mpeg')
+                'recording': (Path(file_path).name, f, mime_type)
             }
 
             data = {
                 "content": transcription_text,
-                "model_used": "whisper",
+                "model_used": f"whisper - {MODEL_VERSION}",
                 "generation_time_secs": str(execution_time),
+                "transcription_speed_ratio": str(transcription_speed_ratio),
                 "status": "transcribed",
                 "session": session_id
             }
@@ -115,14 +125,53 @@ def process_audio_transcription(
                 data=data,
                 headers=headers
             )
+            response.raise_for_status()
 
             record = response.json()
+
             logger.info(f"Created transcription record: {record['id']}")
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error occurred: {str(e)}")
+        logger.error(f"Response content: {e.response.text}")
+
     except Exception as e:
         logger.error(f"Error processing transcription: {str(e)}")
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
+
+
+def load_model(version: str):
+    global model, MODEL_VERSION
+    MODEL_VERSION = version
+    model = whisper.load_model(MODEL_VERSION)
+
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+        logger.info(f"Model {version} loaded successfully on GPU")
+    else:
+        logger.warning(f"CUDA not available, using CPU for model {version}")
+
+    return {"status": "success", "model": version}
+
+
+# FastAPI endpoint
+@app.post("/api/model")
+async def change_model(model_version: str):
+    try:
+        valid_models = ["tiny", "base", "small", "medium", "large", "turbo"]
+        if model_version not in valid_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model version. Must be one of: {', '.join(valid_models)}"
+            )
+
+        result = load_model(model_version)
+        return result
+    except Exception as e:
+        logger.error(f"Error changing model: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/transcribe/{user_id}")
