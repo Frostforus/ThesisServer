@@ -1,5 +1,6 @@
 import torch
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from datetime import datetime
 import whisper
 import os
@@ -68,6 +69,7 @@ model: Optional[whisper.Whisper] = None
 @app.on_event("startup")
 async def startup_event():
     load_model(MODEL_VERSION)
+    setup_llm()
 
 
 def process_audio_transcription(
@@ -96,6 +98,43 @@ def process_audio_transcription(
         transcription_speed_ratio = audio_length / execution_time
         logger.debug(f"Transcription speed ratio: {transcription_speed_ratio:.2f}x")
         logger.debug(f"Transcription: {transcription_text}")
+        system_prompt = """<|im_start|>system
+        You are a experienced clinical supervisor assisting a therapist in documenting session notes. Generate a structured journal entry that includes:
+        1. Key themes and patterns
+        2. Client presentation (affect, cognition, behavior)
+        3. Hypothesized maintaining factors
+        4. Intervention opportunities
+        5. Treatment plan considerations
+        Use professional terminology but avoid jargon. Format with clear headings and bullet points use a standard markdown format.<|im_end|>
+        <|im_start|>user
+        Create therapist journal entry from this session transcript:
+
+        """
+        start_time = time.time()
+        extra_prompot = """<|im_start|>system
+        You are a helpful AI assistant. Structure all responses in this exact markdown format:
+        
+        # Main Topic
+        
+        ## Key Points
+        - First point
+        - Second point
+        
+        ## Details
+        [Content here]
+        
+        Use only these markdown elements:
+        1. # for main headings
+        2. ## for subheadings
+        3. - for bullet points
+        4. 1. 2. 3. for numbered lists
+        5. ` for code
+        <|im_end|>"""
+
+        llm_output = generate_response(system_prompt + transcription_text + f"{extra_prompot}\n<|im_end|>\n")
+        execution_time = time.time() - start_time
+        logger.debug(f"LLM generation time: {execution_time:.2f} seconds")
+        logger.debug(f"LLM output: {llm_output}")
 
         url = "http://localhost:8090/api/collections/transcriptions/records"
 
@@ -140,6 +179,52 @@ def process_audio_transcription(
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
+
+
+def setup_llm():
+    global llm_model, llm_tokenizer
+
+    try:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype="float16",
+        )
+
+        model_id = "deepseek-ai/deepseek-llm-7b-chat"
+
+        llm_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=quant_config,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype="auto",
+        )
+
+        llm_tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        logger.info("LLM model loaded successfully")
+        return {"status": "success", "model": model_id}
+    except Exception as e:
+        logger.error(f"Error loading LLM model: {str(e)}")
+        raise
+
+
+def generate_response(prompt: str) -> str:
+    if llm_model is None or llm_tokenizer is None:
+        raise RuntimeError("LLM model not initialized")
+
+    inputs = llm_tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+    outputs = llm_model.generate(
+        **inputs,
+        max_new_tokens=5120,
+        temperature=0.7,
+        repetition_penalty=1.15,
+        do_sample=True,
+        top_p=0.9,
+        eos_token_id=llm_tokenizer.eos_token_id,
+    )
+    return llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 
 def load_model(version: str):
@@ -227,3 +312,13 @@ async def root():
 @app.get("/hello/{name}")
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
+
+
+@app.post("/api/generate")
+async def generate(prompt: str):
+    try:
+        response = generate_response(prompt)
+        return {"response": response}
+    except Exception as e:
+        logger.error(f"Error generating response: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
